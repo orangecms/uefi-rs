@@ -36,6 +36,10 @@ const MSR_SMI_COUNT: u32 = 0x00000034;
 const MSR_MTRR_CAP: u32 = 0x000000fe;
 const IA32_SMRR_PHYBASE: u32 = 0x1f2;
 const IA32_SMRR_PHYMASK: u32 = 0x1f3;
+const IA32_MTRR_PHYBASE0: u32 = 0x200;
+const IA32_MTRR_PHYMASK0: u32 = 0x201;
+const IA32_MTRR_PHYBASE1: u32 = 0x202;
+const IA32_MTRR_PHYMASK1: u32 = 0x203;
 
 // ports
 const APM_CNT_PORT: u16 = 0xb2;
@@ -59,27 +63,7 @@ fn read_msr_32(msr: u32) -> [u32; 4] {
 }
 
 fn rdmsr(msr: u32) -> u64 {
-    let m = Msr::new(msr);
-    unsafe { m.read() }
-}
-
-fn smrr_check() {
-    // bit 11 means SMRR supported
-    let mtrr_cap = rdmsr(MSR_MTRR_CAP);
-    info!("MTRR cap: 0x{:04x}", mtrr_cap);
-    let smrr_support = if (mtrr_cap >> 11) & 0x1 == 0x1 {
-        true
-    } else {
-        false
-    };
-    info!("SMRR support: {:?}", smrr_support);
-
-    // If SMRR is not supported, reading SMRR MSRs will cause exceptions:
-    // X64 Exception Type - 0D(#GP - General Protection)  CPU Apic ID - 00000000
-    if smrr_support {
-        info!("IA32_SMRR_PHYBASE: {}", rdmsr(IA32_SMRR_PHYBASE));
-        info!("IA32_SMRR_PHYMASK: {}", rdmsr(IA32_SMRR_PHYMASK));
-    }
+    unsafe { Msr::new(msr).read() }
 }
 
 /* SMI check */
@@ -96,6 +80,66 @@ fn smi_check() {
     info!("SMI count: {}", rdmsr(MSR_SMI_COUNT));
 }
 
+fn smrr_check() -> u8 {
+    let mtrr_cap = rdmsr(MSR_MTRR_CAP);
+    info!("MTRR cap: 0x{:04x}", mtrr_cap);
+
+    let mtrr_count = mtrr_cap as u8;
+    info!("MTRR count: {}", mtrr_count);
+
+    let mtrr_fixed_support = if (mtrr_cap >> 8) & 0x1 == 0x1 {
+        true
+    } else {
+        false
+    };
+    info!("MTRR fixed range support: {:?}", mtrr_fixed_support);
+
+    let wc_support = if (mtrr_cap >> 10) & 0x1 == 0x1 {
+        true
+    } else {
+        false
+    };
+    info!("WC support: {:?}", wc_support);
+
+    let smrr_support = if (mtrr_cap >> 11) & 0x1 == 0x1 {
+        true
+    } else {
+        false
+    };
+    info!("SMRR support: {:?}", smrr_support);
+
+    // https://github.com/chipsec/chipsec/blob/main/chipsec/modules/common/sgx_check.py
+    let prmrr_support = if (mtrr_cap >> 12) & 0x1 == 0x1 {
+        true
+    } else {
+        false
+    };
+    info!("PRMRR support: {:?}", prmrr_support);
+
+    // If SMRR is not supported, reading SMRR MSRs will cause exceptions:
+    // X64 Exception Type - 0D(#GP - General Protection)  CPU Apic ID - 00000000
+    if smrr_support {
+        // NOTE: The base address is the TSEG region base, protected by SMRR.
+        info!("SMRR base: {:08x}", rdmsr(IA32_SMRR_PHYBASE));
+        // NOTE: Each CPU has its own SMRR, but most often, all SMRR[X] have the
+        // same base and mask set.
+        info!("SMRR mask: {:08x}", rdmsr(IA32_SMRR_PHYMASK));
+    }
+
+    mtrr_count
+}
+
+fn mtrr_check(mtrr_count: u8) {
+    for i in 0..(mtrr_count as u32) {
+        info!("MTRR{i} base: {:012x}", rdmsr(IA32_MTRR_PHYBASE0 + i));
+        info!("MTRR{i} mask: {:012x}", rdmsr(IA32_MTRR_PHYMASK0 + i * 2));
+    }
+}
+
+// TODO: SGX / Processor Reserved Memory ?
+// https://acsl.group/wp-content/uploads/2019/10/MSC-2019-02.pdf
+// http://cwfletcher.net/Content/598/lec04_sgx.pdf
+
 #[entry]
 fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // Initialize utilities (logging, memory allocation...)
@@ -108,8 +152,13 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     st.firmware_vendor().as_str_in_buf(&mut buf).unwrap();
     info!("Firmware Vendor: {}", buf.as_str());
 
-    smrr_check();
     smi_check();
+    let mtrr_count = smrr_check();
+    mtrr_check(mtrr_count);
+
+    let cr0 = x86_64::registers::control::Cr0::read();
+    let pe = cr0;
+    info!("CR0: {:?}", cr0);
 
     // Test print! and println! macros.
     let (print, println) = ("print!", "println!"); // necessary for clippy to ignore
